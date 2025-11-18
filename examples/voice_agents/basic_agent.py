@@ -1,5 +1,5 @@
 import logging
-
+import asyncio
 from dotenv import load_dotenv
 
 from livekit.agents import (
@@ -8,59 +8,51 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RunContext,
     cli,
-    metrics,
     room_io,
 )
 from livekit.agents.llm import function_tool
-from livekit.plugins import silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins import silero
 
-# uncomment to enable Krisp background voice/noise cancellation
-# from livekit.plugins import noise_cancellation
-
-logger = logging.getLogger("basic-agent")
+# Import your custom handler and helpers from the local file
+from livekit.agents.interrupt_handler import (
+    handle_transcript_event,
+    normalize_text,
+    tokenize,
+    is_filler_sequence,
+    MIN_CONFIDENCE
+)
 
 load_dotenv()
+logger = logging.getLogger("agent")
 
 
 class MyAgent(Agent):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__(
-            instructions="Your name is Kelly. You would interact with users via voice."
-            "with that in mind keep your responses concise and to the point."
-            "do not use emojis, asterisks, markdown, or other special characters in your responses."
-            "You are curious and friendly, and have a sense of humor."
-            "you will speak english to the user",
+            instructions=(
+                "Your name is Kelly. Keep responses short. "
+                "Speak English. No emojis."
+            )
         )
+        self.is_agent_speaking = False  # Manual flag initialized
 
     async def on_enter(self):
-        # when the agent is added to the session, it'll generate a reply
-        # according to its instructions
         self.session.generate_reply()
 
-    # all functions annotated with @function_tool will be passed to the LLM when this
-    # agent is active
+    # The SDK automatically calls these methods if they are defined on the Agent class.
+    
+    def on_speech_start(self, ev):
+        self.is_agent_speaking = True
+
+    def on_speech_end(self, ev):
+        self.is_agent_speaking = False
+        
     @function_tool
-    async def lookup_weather(
-        self, context: RunContext, location: str, latitude: str, longitude: str
-    ):
-        """Called when the user asks for weather related information.
-        Ensure the user's location (city or region) is provided.
-        When given a location, please estimate the latitude and longitude of the location and
-        do not ask the user for them.
-
-        Args:
-            location: The location they are asking for
-            latitude: The latitude of the location, do not ask user for it
-            longitude: The longitude of the location, do not ask user for it
-        """
-
-        logger.info(f"Looking up weather for {location}")
-
-        return "sunny with a temperature of 70 degrees."
+    async def lookup_weather(self, ctx: RunContext, location: str, latitude: str, longitude: str):
+        return "sunny with 70 degrees."
 
 
 server = AgentServer()
@@ -75,56 +67,84 @@ server.setup_fnc = prewarm
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    # each log entry will include these fields
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
+
+    # Instantiate the agent outside of session.start
+    my_agent_instance = MyAgent()
+    
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt="deepgram/nova-3",
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
         llm="openai/gpt-4.1-mini",
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts="cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
-        # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
-        # when it's detected, you may resume the agent's speech
+
+        # Enable false interruption resume and set timeout to instant
+        preemptive_generation=False,
         resume_false_interruption=True,
-        false_interruption_timeout=1.0,
+        false_interruption_timeout=0.0,
     )
 
-    # log metrics as they are emitted, and total usage after session is over
-    usage_collector = metrics.UsageCollector()
+    @session.on("transcription")
+    def _on_transcription(ev):
 
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
+        alts = getattr(ev, "alternatives", None)
+        if alts and len(alts) > 0:
+            alt = alts[0]
+            text = getattr(alt, "text", "") or ""
+            conf = getattr(alt, "confidence", 1.0)
+        else:
+            text = getattr(ev, "text", "") or ""
+            conf = getattr(ev, "confidence", 1.0)
 
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
+        print(f"[TRANSCRIPTION] {text!r} conf={conf}")
 
-    # shutdown callbacks are triggered when the session is over
-    ctx.add_shutdown_callback(log_usage)
+        # Pass the agent instance to the handler
+        asyncio.create_task(handle_transcript_event(session, text, conf, my_agent_instance))
+
+    # -----------------------------------------------------------
+    # STT FALLBACK EVENT (Pass the agent instance)
+    # -----------------------------------------------------------
+    @session.on("stt")
+    def _on_stt(ev):
+        text = getattr(ev, "text", "") or ""
+        conf = getattr(ev, "confidence", 1.0)
+        print(f"[STT] {text!r} conf={conf}")
+
+        # Pass the agent instance to the handler
+        asyncio.create_task(handle_transcript_event(session, text, conf, my_agent_instance))
+
+    # -----------------------------------------------------------
+    # USER UTTERANCE END (Used for filtering LLM input)
+    # -----------------------------------------------------------
+    @session.on("user_utterance_end")
+    def _on_utterance_end(ev):
+        text = getattr(ev, "text", "") or ""
+        conf = getattr(ev, "confidence", 1.0)
+        
+        t = normalize_text(text)
+        
+        # 1. Check for empty, low confidence, or pure filler
+        is_filler = (
+            not t or 
+            conf < MIN_CONFIDENCE or 
+            is_filler_sequence(tokenize(t))
+        )
+        
+        if is_filler:
+            print("[LLM_IGNORED] reason=filtered by custom logic (filler/low confidence)")
+            session.set_action("ignore") # Explicitly prevent LLM reply
+            return
+        
+        # If it reaches here, the utterance is valid and will be sent to the LLM
+        print(f"[LLM_PROCESSED] reason=real speech text='{t}'")
+
 
     await session.start(
-        agent=MyAgent(),
+        agent=my_agent_instance, # Use the instantiated agent
         room=ctx.room,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                # uncomment to enable the Krisp BVC noise cancellation
-                # noise_cancellation=noise_cancellation.BVC(),
-            ),
+            audio_input=room_io.AudioInputOptions()
         ),
     )
 

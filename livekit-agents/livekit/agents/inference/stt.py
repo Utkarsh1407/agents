@@ -7,6 +7,8 @@ import os
 import weakref
 from dataclasses import dataclass, replace
 from typing import Any, Literal, TypedDict, Union, overload
+from livekit.agents.interrupt_handler import handle_transcript_event
+
 
 import aiohttp
 
@@ -482,23 +484,38 @@ class SpeechStream(stt.SpeechStream):
         request_id = data.get("request_id", self._request_id)
         text = data.get("transcript", "")
         language = data.get("language", self._opts.language or "en")
+        confidence = data.get("confidence", 1.0)   # ✅ FIX — Define confidence
 
+        # Ignore empty interim transcripts
         if not text and not is_final:
             return
-        # We'll have a more accurate way of detecting when speech started when we have VAD
+
+        # Detect speech start
         if not self._speaking:
             self._speaking = True
             start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
             self._event_ch.send_nowait(start_event)
 
+        # Package speech data
         speech_data = stt.SpeechData(
             language=language,
             start_time=data.get("start", 0),
-            end_time=data.get("duration", 0),  # This is the duration transcribed so far
-            confidence=data.get("confidence", 1.0),
+            end_time=data.get("duration", 0),
+            confidence=confidence,
             text=text,
         )
-
+        
+        if is_final:
+            try:
+                session = getattr(self, "_session", None)
+                if session:
+                    import asyncio
+                    asyncio.create_task(
+                        handle_transcript_event(session, text, confidence)
+                    )
+            except Exception as e:
+                print("Interrupt handler failed:", e)
+        # Emit events for final transcript
         if is_final:
             if self._speech_duration > 0:
                 self._event_ch.send_nowait(
@@ -512,6 +529,7 @@ class SpeechStream(stt.SpeechStream):
                 )
                 self._speech_duration = 0
 
+            # Final transcript event
             event = stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                 request_id=request_id,
@@ -519,11 +537,14 @@ class SpeechStream(stt.SpeechStream):
             )
             self._event_ch.send_nowait(event)
 
+            # Speech end
             if self._speaking:
                 self._speaking = False
                 end_event = stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
                 self._event_ch.send_nowait(end_event)
+
         else:
+            # Interim transcript event
             event = stt.SpeechEvent(
                 type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
                 request_id=request_id,

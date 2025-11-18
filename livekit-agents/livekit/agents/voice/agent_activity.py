@@ -1125,6 +1125,21 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx.items.append(msg)
             self._session._conversation_item_added(msg)
 
+    async def register_user_transcript(self, text: str, confidence: float):
+        """Store the transcript text + confidence for this user turn."""
+        if not hasattr(self, "_user_transcripts"):
+            self._user_transcripts = []
+
+        self._user_transcripts.append({
+            "text": text,
+            "confidence": confidence
+        })
+
+    async def commit_user_turn(self):
+        """Called when user finishes speaking so the agent can respond."""
+        if hasattr(self, "_on_user_turn_commit"):
+            await self._on_user_turn_commit()
+            
     def _on_generation_created(self, ev: llm.GenerationCreatedEvent) -> None:
         if ev.user_initiated:
             # user_initiated generations are directly handled inside _realtime_reply_task
